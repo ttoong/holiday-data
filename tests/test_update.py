@@ -226,5 +226,14 @@ class UpdateTests(unittest.TestCase):
         restored = self.prepare(NOW + timedelta(seconds=3), initial=False)
         self.assertEqual(restored['cache']['revision'], 3)
 
+    def test_restart_cannot_confirm_packet_before_site_metadata_matches(self):
+        self.prepare(); packet = (self.root / u.PACKET_PATH).read_bytes()
+        before = (self.root / 'state/ledger.json').read_bytes()
+        def fetch(url, accepted=(200,)):
+            return (200, packet) if url.endswith('/current.json') else (200, b'old site')
+        with self.assertRaises(u.Failed): u.reconcile(self.root, NOW, fetch, self.verify)
+        self.assertEqual(before, (self.root / 'state/ledger.json').read_bytes())
+        self.assertFalse((self.root / 'state/confirmed.json').exists())
+
 
 if __name__ == '__main__': unittest.main()

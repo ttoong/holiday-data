@@ -251,6 +251,14 @@ def remote_packets(fetch=http):
     return result[0]
 
 
+def verify_public_site(root, fetch=http):
+    """재시작 복구도 처음 확인과 동일하게 표시 파일까지 대조해야 성공이 됩니다."""
+    for origin in ORIGINS:
+        for name in ['index.html', 'status.json', 'kr/v1/public-key.json']:
+            _, raw = fetch(origin + ('/' if name == 'index.html' else '/' + name))
+            require(raw == (root / 'site' / name).read_bytes(), 'Published site differs; pending preserved')
+
+
 def render_site(root, release, packet):
     """공개 설명에도 실제 조회 시각과 제공 범위를 표시하고 API 이름/계정은 넣지 않습니다."""
     cache = release['cache']
@@ -283,6 +291,7 @@ def reconcile(root, now, fetch=http, verify=None):
     candidate = read_file(root, PACKET_PATH)
     candidate_release = validate_packet(candidate, now, fresh=False, verify=verify)
     if live == candidate:
+        verify_public_site(root, fetch)
         state['confirmed'] = pending
         write_file(root, 'state/confirmed.json', candidate)
         outcome = 'confirmed-after-restart'
@@ -343,10 +352,7 @@ def confirm(root, now, fetch=http, verify=None):
     packet = read_file(root, PACKET_PATH)
     release = validate_packet(packet, now, verify=verify)
     require(remote_packets(fetch) == packet, 'Published packet differs; pending preserved')
-    for origin in ORIGINS:
-        for name in ['index.html', 'status.json', 'kr/v1/public-key.json']:
-            _, raw = fetch(origin + ('/' if name == 'index.html' else '/' + name))
-            require(raw == (root / 'site' / name).read_bytes(), 'Published site differs; pending preserved')
+    verify_public_site(root, fetch)
     state['confirmed'] = state['pending']
     state['lastAttempt'] = attempt_record(state['pending'], release, 'confirmed')
     state['pending'] = None
