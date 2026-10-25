@@ -20,6 +20,10 @@ class BootstrapTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.site = Path(self.temp.name) / 'site'
         shutil.copytree(ROOT / 'site', self.site)
+        # 운영 자료가 생긴 뒤에도 준비 단계 안전 검사는 별도의 합성 사본에서 유지합니다.
+        (self.site / 'kr/v1/current.json').unlink(missing_ok=True)
+        (self.site / 'status.json').write_text(json.dumps({'format': 1, 'phase': 'bootstrap',
+            'feedAvailable': False, 'scheduledRefreshEnabled': False}))
         self.files = b.validate_site(self.site)
 
     def tearDown(self):
