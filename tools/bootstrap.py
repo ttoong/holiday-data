@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,16 +59,24 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def request(url, token=None):
+def request(url, token=None, expected_status=200):
     """정해진 호출부에서만 사용하며 제한된 본문을 읽고 실패 원문은 숨깁니다."""
     headers = {'User-Agent': 'achimgyeol-holiday-bootstrap/1'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
     try:
-        with urllib.request.build_opener(NoRedirect).open(
-                urllib.request.Request(url, headers=headers), timeout=20) as response:
-            if response.status != 200:
-                raise CheckFailed('Unexpected HTTP status')
+        try:
+            response = urllib.request.build_opener(NoRedirect).open(
+                urllib.request.Request(url, headers=headers), timeout=20)
+        except urllib.error.HTTPError as error:
+            # 없는 공급 파일이 HTML 200으로 위장하지 않는지 404 본문까지 검증합니다.
+            # 리다이렉트나 인증 오류는 예상 성공 상태로 처리하지 않습니다.
+            if error.code != expected_status:
+                raise CheckFailed('Unexpected HTTP status: ' + str(error.code)) from None
+            response = error
+        with response:
+            if response.status != expected_status:
+                raise CheckFailed('Unexpected HTTP status: ' + str(response.status))
             data = response.read(1_000_001)
             if len(data) > 1_000_000:
                 raise CheckFailed('Response too large')
@@ -79,11 +88,19 @@ def request(url, token=None):
 
 
 def verify_remote(files, fetch=request):
-    """배포되는 _headers는 본문이 아니므로 나머지 공개 파일의 바이트를 대조합니다."""
+    """Pages의 정규 URL과 미게시 API 404를 검사하며 리다이렉트를 따르지 않습니다.
+
+    Pages는 index.html을 /로, 다른 .html 경로를 확장자 없는 경로로 308 이동합니다.
+    따라서 원본 파일명으로 조회하지 않고 실제 사용자 경로의 본문/상태를 대조합니다.
+    """
     for name, data in files.items():
         if name == '_headers':
             continue
-        if fetch(ORIGIN + '/' + name) != data:
+        path = '/' if name == 'index.html' else '/' + name
+        status = 200
+        if name == '404.html':
+            path, status = '/kr/v1/current.json', 404
+        if fetch(ORIGIN + path, expected_status=status) != data:
             raise CheckFailed('Published bytes differ')
 
 
@@ -110,7 +127,7 @@ def should_deploy(files, account, token, fetch=request):
         raise CheckFailed('Missing deployment metadata')
     if project['latest_deployment'] is None:
         return True
-    verify_remote(files, lambda url: fetch(url))
+    verify_remote(files, fetch)
     return False
 
 
