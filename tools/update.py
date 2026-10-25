@@ -99,7 +99,9 @@ def http(url, accepted=(200,)):
         req = urllib.request.Request(url, headers={'User-Agent': 'achimgyeol-holiday-feed/1', 'Accept': '*/*'})
         try: response = urllib.request.build_opener(NoRedirect).open(req, timeout=20)
         except urllib.error.HTTPError as error:
-            if error.code not in accepted: raise Failed('HTTP status ' + str(error.code)) from None
+            if error.code not in accepted:
+                error.close()
+                raise Failed('HTTP status ' + str(error.code)) from None
             response = error
         with response:
             require(response.status in accepted, 'Unexpected HTTP status')
@@ -343,7 +345,10 @@ def validate_upload(root, now, verify=None):
     for name in ['KASI_SERVICE_KEY', 'HOLIDAY_SIGNING_PRIVATE_KEY', 'CLOUDFLARE_API_TOKEN']:
         secret = os.environ.get(name)
         if secret:
-            require(not any(secret.encode() in p.read_bytes() for p in paths if p.is_file()), 'Secret found in upload')
+            # packet의 payload는 base64이므로 원문도 검사해야 비휴일 이름 등에 숨은 값도 잡습니다.
+            payload = base64.b64decode(decode(read_file(root, PACKET_PATH))['payload'], validate=True)
+            require(secret.encode() not in payload
+                    and not any(secret.encode() in p.read_bytes() for p in paths if p.is_file()), 'Secret found in upload')
 
 
 def main():

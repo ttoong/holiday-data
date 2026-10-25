@@ -187,5 +187,14 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaises(u.Failed): self.prepare(NOW - timedelta(seconds=1), initial=False)
         self.assertEqual(before, (self.root / 'state/ledger.json').read_bytes())
 
+    def test_secret_in_encoded_nonholiday_payload_is_also_rejected(self):
+        def collect(year, key):
+            return rows(year) + [{'date': str(year) + '0717', 'name': 'FAKE_ENCODED_SECRET',
+                                  'sequence': 1, 'isHoliday': False}]
+        with patch.dict('os.environ', {'KASI_SERVICE_KEY': 'FAKE_ENCODED_SECRET'}):
+            self.prepare(collect=collect)
+            self.assertNotIn(b'FAKE_ENCODED_SECRET', (self.root / 'site/index.html').read_bytes())
+            with self.assertRaises(u.Failed): u.validate_upload(self.root, NOW, self.verify)
+
 
 if __name__ == '__main__': unittest.main()

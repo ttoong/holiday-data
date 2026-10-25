@@ -72,6 +72,7 @@ def request(url, token=None, expected_status=200):
             # 없는 공급 파일이 HTML 200으로 위장하지 않는지 404 본문까지 검증합니다.
             # 리다이렉트나 인증 오류는 예상 성공 상태로 처리하지 않습니다.
             if error.code != expected_status:
+                error.close()
                 raise CheckFailed('Unexpected HTTP status: ' + str(error.code)) from None
             response = error
         with response:
