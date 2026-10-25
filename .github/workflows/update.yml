@@ -1,0 +1,73 @@
+name: Update official holidays
+on:
+  workflow_dispatch:
+    inputs:
+      initial_publish:
+        description: 'Only the first approved publication needs this flag'
+        type: boolean
+        default: false
+  schedule:
+    # UTC 22:15 / 10:15 = 대한민국 07:15 / 19:15. GitHub 지연/누락 가능성은 별도 한계입니다.
+    - cron: '15 22,10 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: holiday-pages-production
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      HOLIDAY_SIGNER_BIN: ${{ runner.temp }}/holiday-sign
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Compile the reviewed signing tool
+        run: swiftc -parse-as-library tools/Sign.swift -o "$HOLIDAY_SIGNER_BIN"
+      - name: Offline tests with synthetic transport and ephemeral keys
+        run: |
+          python3 -m unittest discover -s tests -v
+          "$HOLIDAY_SIGNER_BIN" selftest
+      - name: Reconcile the previous attempt without reuploading it
+        run: python3 tools/update.py reconcile
+      - name: Persist reconciled state before fetching a new candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/commit_state.py reconcile
+      - name: Fetch official years, validate and sign the new candidate
+        env:
+          KASI_SERVICE_KEY: ${{ secrets.KASI_SERVICE_KEY }}
+          HOLIDAY_SIGNING_PRIVATE_KEY: ${{ secrets.HOLIDAY_SIGNING_PRIVATE_KEY }}
+          INITIAL_PUBLISH: ${{ inputs.initial_publish }}
+        run: |
+          if [ "$INITIAL_PUBLISH" = "true" ]; then
+            python3 tools/update.py prepare --initial
+          else
+            python3 tools/update.py prepare
+          fi
+      - name: Record candidate and sequence before any upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/commit_state.py prepare
+      - name: Validate the committed upload files
+        run: python3 tools/update.py validate
+      - name: Upload only the validated public site
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.152.0'
+          command: pages deploy site --project-name=mochacookie-holidays --branch=main
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+      - name: Verify exact signed data and site at both HTTPS origins
+        run: python3 tools/update.py confirm
+      - name: Persist confirmed publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/commit_state.py confirm
