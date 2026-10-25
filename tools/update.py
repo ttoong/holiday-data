@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -205,11 +206,15 @@ def load_state(root, now, verify=None):
     require(integer(state['format'], 1, 1) and integer(state['highWater'], 0), 'Invalid sequence ledger')
     last = state['lastAttempt']
     if last is not None:
-        require(type(last) is dict and set(last) == {'sequence', 'sha256', 'outcome'}
+        base_fields = {'sequence', 'sha256', 'outcome'}
+        require(type(last) is dict and set(last) in [base_fields, base_fields | {'contentRevision', 'yearsSHA256'}]
                 and integer(last['sequence']) and last['sequence'] <= state['highWater']
                 and type(last['sha256']) is str and len(last['sha256']) == 64
                 and all(c in '0123456789abcdef' for c in last['sha256'])
                 and last['outcome'] in ['confirmed', 'confirmed-after-restart', 'not-published-new-sequence-required'])
+        if 'contentRevision' in last:
+            require(integer(last['contentRevision']) and type(last['yearsSHA256']) is str
+                    and len(last['yearsSHA256']) == 64 and all(c in '0123456789abcdef' for c in last['yearsSHA256']))
     for field in ['pending', 'confirmed']:
         entry = state[field]
         if entry is not None:
@@ -229,6 +234,12 @@ def load_state(root, now, verify=None):
 
 
 def persist(root, state): write_file(root, 'state/ledger.json', encode(state))
+
+
+def attempt_record(entry, release, outcome):
+    """게시되었을 수도 있는 실패 후보의 내용 버전도 보존해 이후 값이 낮아지지 않게 합니다."""
+    return {**entry, 'outcome': outcome, 'contentRevision': release['cache']['revision'],
+            'yearsSHA256': digest(encode(release['cache']['years']))}
 
 
 def remote_packets(fetch=http):
@@ -270,6 +281,7 @@ def reconcile(root, now, fetch=http, verify=None):
         require(live == old, 'Unknown live data; publishing blocked')
         return False
     candidate = read_file(root, PACKET_PATH)
+    candidate_release = validate_packet(candidate, now, fresh=False, verify=verify)
     if live == candidate:
         state['confirmed'] = pending
         write_file(root, 'state/confirmed.json', candidate)
@@ -285,7 +297,7 @@ def reconcile(root, now, fetch=http, verify=None):
                                                        'scheduledRefreshEnabled': False}))
             write_file(root, 'site/index.html', (root / 'templates/bootstrap-index.html').read_bytes())
         outcome = 'not-published-new-sequence-required'
-    state['lastAttempt'] = {**pending, 'outcome': outcome}
+    state['lastAttempt'] = attempt_record(pending, candidate_release, outcome)
     state['pending'] = None; persist(root, state)
     return True
 
@@ -299,8 +311,19 @@ def prepare(root, now, initial=False, collect=fetch_year, sign=None, verify=None
     years = {str(y): validate_rows(collect(y, key), y) for y in [year, year + 1]}
     previous = validate_packet(old, now, fresh=False, verify=verify) if old else None
     if previous: require(instant(previous['cache']['fetchedAt']) <= now and instant(previous['publishedAt']) <= now, 'Clock moved backwards')
-    same = previous is not None and previous['cache']['years'] == years
-    revision = previous['cache']['revision'] if same else (previous['cache']['revision'] if previous else 0) + 1
+    baselines = []
+    if previous:
+        baselines.append((previous['cache']['revision'], digest(encode(previous['cache']['years']))))
+    last = state['lastAttempt']
+    if last and 'contentRevision' in last:
+        baselines.append((last['contentRevision'], last['yearsSHA256']))
+    elif last:
+        require(last['outcome'] in ['confirmed', 'confirmed-after-restart'], 'Legacy failed content version needs review')
+    highest = max((entry[0] for entry in baselines), default=0)
+    latest_hashes = {entry[1] for entry in baselines if entry[0] == highest}
+    require(len(latest_hashes) <= 1, 'Conflicting content revisions')
+    same = digest(encode(years)) in latest_hashes
+    revision = highest if same else highest + 1
     release = {'format': 1, 'sequence': state['highWater'] + 1, 'source': SOURCE, 'publishedAt': stamp(now),
                'expiresAt': stamp(now + timedelta(days=7)),
                'cache': {'format': 1, 'revision': revision, 'fetchedAt': stamp(now), 'years': years}}
@@ -318,14 +341,14 @@ def confirm(root, now, fetch=http, verify=None):
     state, _ = load_state(root, now, verify)
     require(state['pending'] is not None, 'Missing pending publication')
     packet = read_file(root, PACKET_PATH)
-    validate_packet(packet, now, verify=verify)
+    release = validate_packet(packet, now, verify=verify)
     require(remote_packets(fetch) == packet, 'Published packet differs; pending preserved')
     for origin in ORIGINS:
         for name in ['index.html', 'status.json', 'kr/v1/public-key.json']:
             _, raw = fetch(origin + ('/' if name == 'index.html' else '/' + name))
             require(raw == (root / 'site' / name).read_bytes(), 'Published site differs; pending preserved')
     state['confirmed'] = state['pending']
-    state['lastAttempt'] = {**state['pending'], 'outcome': 'confirmed'}
+    state['lastAttempt'] = attempt_record(state['pending'], release, 'confirmed')
     state['pending'] = None
     write_file(root, 'state/confirmed.json', packet); persist(root, state)
 
@@ -351,18 +374,29 @@ def validate_upload(root, now, verify=None):
                     and not any(secret.encode() in p.read_bytes() for p in paths if p.is_file()), 'Secret found in upload')
 
 
+def retry_public_read(action, wait=time.sleep):
+    """배포 직후 반영 지연은 같은 파일을 최대6번 재조회합니다. 재업로드/검증 해제는 없습니다."""
+    retryable = {'Published packet differs; pending preserved', 'Published site differs; pending preserved',
+                 'Public origins disagree; preserve pending state', 'Network read failed; details suppressed'}
+    for attempt in range(6):
+        try: return action()
+        except Failed as error:
+            if str(error) not in retryable or attempt == 5: raise
+            wait(3)
+
+
 def main():
     try:
         now = datetime.now(timezone.utc).replace(microsecond=0)
         command = sys.argv[1] if len(sys.argv) > 1 else ''
-        if command == 'reconcile': reconcile(ROOT, now)
+        if command == 'reconcile': retry_public_read(lambda: reconcile(ROOT, now))
         elif command == 'prepare':
             require(sys.argv[2:] in [[], ['--initial']], 'Invalid preparation arguments')
             release = prepare(ROOT, now, initial=sys.argv[2:] == ['--initial'])
             validate_upload(ROOT, now)
             print('Prepared release sequence ' + str(release['sequence']))
         elif command == 'validate': validate_upload(ROOT, now)
-        elif command == 'confirm': confirm(ROOT, now)
+        elif command == 'confirm': retry_public_read(lambda: confirm(ROOT, now))
         else: raise Failed('Use reconcile, prepare [--initial], validate or confirm')
         print('PASS: ' + command)
         return 0

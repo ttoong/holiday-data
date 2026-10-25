@@ -196,5 +196,35 @@ class UpdateTests(unittest.TestCase):
             self.assertNotIn(b'FAKE_ENCODED_SECRET', (self.root / 'site/index.html').read_bytes())
             with self.assertRaises(u.Failed): u.validate_upload(self.root, NOW, self.verify)
 
+    def test_transient_readback_is_retried_without_real_wait(self):
+        calls, waits = [], []
+        def action():
+            calls.append(1)
+            if len(calls) < 3: raise u.Failed('Published site differs; pending preserved')
+            return 'confirmed'
+        self.assertEqual(u.retry_public_read(action, waits.append), 'confirmed')
+        self.assertEqual(len(calls), 3); self.assertEqual(waits, [3, 3])
+
+    def test_readback_retry_is_bounded_and_keeps_pending(self):
+        self.prepare(); before = (self.root / 'state/ledger.json').read_bytes(); calls = []
+        def action(): calls.append(1); raise u.Failed('Published site differs; pending preserved')
+        with self.assertRaises(u.Failed): u.retry_public_read(action, lambda seconds: None)
+        self.assertEqual(len(calls), 6); self.assertEqual(before, (self.root / 'state/ledger.json').read_bytes())
+
+    def test_corruption_is_not_retried(self):
+        calls = []
+        def action(): calls.append(1); raise u.Failed('State packet hash differs')
+        with self.assertRaises(u.Failed): u.retry_public_read(action, lambda seconds: self.fail('Unexpected retry'))
+        self.assertEqual(len(calls), 1)
+
+    def test_retired_changed_candidate_cannot_lower_content_revision(self):
+        self.prepare(); self.confirm(); old = (self.root / u.PACKET_PATH).read_bytes()
+        def collect(year, key): return rows(year) + [{'date': str(year) + '1009', 'name': '합성 변경', 'sequence': 1, 'isHoliday': True}]
+        changed = self.prepare(NOW + timedelta(seconds=1), initial=False, collect=collect)
+        self.assertEqual(changed['cache']['revision'], 2)
+        u.reconcile(self.root, NOW + timedelta(seconds=2), self.live(old), self.verify)
+        restored = self.prepare(NOW + timedelta(seconds=3), initial=False)
+        self.assertEqual(restored['cache']['revision'], 3)
+
 
 if __name__ == '__main__': unittest.main()
