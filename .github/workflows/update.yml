@@ -21,14 +21,15 @@ jobs:
     permissions:
       contents: write
     env:
-      HOLIDAY_SIGNER_BIN: ${{ runner.temp }}/holiday-sign
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Compile the reviewed signing tool
-        run: swiftc -parse-as-library tools/Sign.swift -o "$HOLIDAY_SIGNER_BIN"
+        run: |
+          swiftc -parse-as-library tools/Sign.swift -o "$RUNNER_TEMP/holiday-sign"
+          echo "HOLIDAY_SIGNER_BIN=$RUNNER_TEMP/holiday-sign" >> "$GITHUB_ENV"
       - name: Offline tests with synthetic transport and ephemeral keys
         run: |
           python3 -m unittest discover -s tests -v
